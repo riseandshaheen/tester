@@ -285,10 +285,19 @@ static bool emit_report(httplib::Client &cli, const std::string &payload_hex) {
 
 static void emit_voucher(httplib::Client &cli,
                          const std::string &destination,
-                         const std::string &payload_hex)
+                         const std::string &payload_hex,
+                         const std::string &value_hex = "")
 {
-    std::string body = "{\"destination\":\"" + destination
-                     + "\",\"payload\":\"" + payload_hex + "\"}";
+    std::string body;
+    if (value_hex.empty()) {
+        body = "{\"destination\":\"" + destination
+              + "\",\"payload\":\"" + payload_hex + "\"}";
+    } else {
+        // value_hex must be 64 hex chars (32 bytes); rollup server requires 0x prefix
+        body = "{\"destination\":\"" + destination
+              + "\",\"payload\":\"" + payload_hex
+              + "\",\"value\":\"0x" + value_hex + "\"}";  
+    }
     auto res = cli.Post("/voucher", body, "application/json");
     if (!res || res->status >= 400)
         std::cerr << "[voucher] emit failed\n";
@@ -495,12 +504,18 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
     }
 
     // eth_withdraw ───────────────────────────────────────────────────────────
+    // v2: destination=receiver, payload=0x (empty), value=amount as 64-char hex
     if (cmd == "eth_withdraw") {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
-        auto calldata = build_eth_withdraw(receiver, amount);
-        emit_voucher(cli, ADDR_ETH_PORTAL, bytes_to_hex(calldata));
-        std::cout << "[advance] voucher: eth_withdraw to=" << receiver << std::endl;
+        // Strip 0x prefix and left-pad to 64 hex chars (32 bytes)
+        std::string amt_hex = amount;
+        if (amt_hex.size() >= 2 && amt_hex[0] == '0' && (amt_hex[1] == 'x' || amt_hex[1] == 'X'))
+            amt_hex = amt_hex.substr(2);
+        while (amt_hex.size() < 64) amt_hex = "0" + amt_hex;
+        emit_voucher(cli, receiver, "0x", amt_hex);
+        std::cout << "[advance] voucher: eth_withdraw to=" << receiver
+                  << " value=" << amt_hex << std::endl;
         return "accept";
     }
 
@@ -592,6 +607,22 @@ static std::string handle_inspect(httplib::Client &cli, picojson::value data) {
     
     std::string payload_hex = data.get("payload").get<std::string>();
     std::string json_str    = hex_payload_to_string(payload_hex);
+    std::cout << "[inspect] raw payload: " << json_str << std::endl;
+
+    // Cartesi v2: the inspect REST endpoint wraps the client body in an outer
+    // {"payload":"0x..."} before passing it to the dapp.  Unwrap it so the
+    // dapp sees the actual JSON command the client sent.
+    {
+        picojson::value outer;
+        std::string outer_err = picojson::parse(outer, json_str);
+        if (outer_err.empty() && outer.is<picojson::object>() &&
+            outer.contains("payload") && !outer.contains("cmd")) {
+            std::string inner_hex = outer.get("payload").get<std::string>();
+            payload_hex = inner_hex;
+            json_str    = hex_payload_to_string(inner_hex);
+            std::cout << "[inspect] unwrapped v2 envelope, inner payload: " << json_str << std::endl;
+        }
+    }
     std::cout << "[inspect] decoded payload: " << json_str << std::endl;
 
     picojson::value input;

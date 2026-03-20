@@ -193,8 +193,11 @@ const voucherDest = (input, n = 0) =>
  */
 async function sendInspect(json) {
   // Cartesi v2: POST /inspect/{app_address}  body: {"payload":"0x{hex}"}
+  // Use the app address directly — INSPECT_URL may contain an app name which
+  // must NOT be combined with the address (node accepts one or the other).
   const hexPayload = '0x' + Buffer.from(JSON.stringify(json)).toString('hex');
-  const url = `${INSPECT_URL}/${ADDR.APP()}`;
+  const nodeBase = NODE_RPC_URL.replace(/\/rpc\/?$/, '');
+  const url = `${nodeBase}/inspect/${ADDR.APP()}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -343,9 +346,16 @@ async function waitForOutputProof(outputIndex, timeoutMs = 300_000) {
   const app      = ADDR.APP();
   const deadline = Date.now() + timeoutMs;
   const bigIdx   = BigInt(outputIndex);
+  let ticks = 0;
   while (Date.now() < deadline) {
     const output = await publicClientL2.getOutput({ application: app, outputIndex: bigIdx });
     if (output && output.outputHashesSiblings !== null) return output;
+    // Mine 2 fresh blocks every ~10s so the node keeps seeing new blocks and is
+    // guaranteed to cross the epoch boundary even if the initial mineBlocks()
+    // call was not picked up immediately by the node's polling loop.
+    if (++ticks % 5 === 0) {
+      await mineBlocks(2).catch(() => {});
+    }
     await sleep(2000);
   }
   throw new Error(`Output ${outputIndex} proof not available after ${timeoutMs}ms`);

@@ -3,7 +3,7 @@
  * Relies on deposits made in suite 01 to pre-load the dapp's internal balances.
  *
  * Voucher destinations:
- *   eth_withdraw          → EtherPortal
+ *   eth_withdraw          → receiver (direct ETH send, v2 pattern)
  *   erc20_withdraw        → ERC20 token contract (transfer to receiver)
  *   erc721_withdraw       → ERC721 token contract (safeTransferFrom)
  *   erc1155_withdraw_*    → ERC1155 token contract (safeTransferFrom / safeBatchTransferFrom)
@@ -20,7 +20,7 @@ import {
 } from '../helpers.js';
 
 describe('Withdrawals', () => {
-  test('eth_withdraw (0.1 ETH) — ACCEPTED, voucher to EtherPortal', async () => {
+  test('eth_withdraw (0.1 ETH) — ACCEPTED, voucher to receiver', async () => {
     const idx = await sendAdvance({
       cmd:      'eth_withdraw',
       receiver: deployer,
@@ -29,7 +29,7 @@ describe('Withdrawals', () => {
     const input = await pollInput(idx);
     expect(input.status).toBe('ACCEPTED');
     expect(voucherCount(input)).toBe(1);
-    expect(voucherDest(input, 0)).toBe(ADDR.ETH_PORTAL.toLowerCase());
+    expect(voucherDest(input, 0)).toBe(deployer.toLowerCase());
   });
 
   test('erc20_withdraw (10 tokens) — ACCEPTED, voucher to ERC20 token', async () => {
