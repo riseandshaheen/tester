@@ -10,6 +10,8 @@
 //   {"cmd":"erc1155_withdraw_single","token":"0x...","receiver":"0x...","id":"0x<uint256>","amount":"0x<uint256>"}
 //   {"cmd":"erc1155_withdraw_batch","token":"0x...","receiver":"0x...","ids":["0x..."],"amounts":["0x..."]}
 //   {"cmd":"mint_erc721","receiver":"0x...","tokenId":"0x<uint256>"}
+//   {"cmd":"delegate_erc20_transfer","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>"}
+//   {"cmd":"delegate_erc20_transfer_targeted","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>","allowedExecutor":"0x..."}
 //
 // Deposits are auto-detected by msg_sender matching portal addresses.
 //
@@ -57,6 +59,10 @@ static const uint8_t SEL_ERC1155_SAFE_BATCH[4]    = {0x2e, 0xb2, 0xc2, 0xd6};
 static const uint8_t SEL_MINT[4]                  = {0x40, 0xc1, 0x0f, 0x19};
 // withdrawEther(address,uint256)  — EtherPortal v2 withdrawal
 static const uint8_t SEL_WITHDRAW_ETHER[4]        = {0x52, 0x2f, 0x68, 0x15};
+// transferERC20(address,address,uint256)  — DelegateVoucherLogic (delegate-call voucher)
+static const uint8_t SEL_DELEGATE_ERC20_TRANSFER[4] = {0x9d, 0xb5, 0xdb, 0xe4};
+// transferERC20Targeted(address,address,uint256,address)
+static const uint8_t SEL_DELEGATE_ERC20_TARGETED[4] = {0x6d, 0x21, 0x52, 0xb9};
 
 // =============================================================================
 // GLOBAL STATE
@@ -171,6 +177,34 @@ static std::vector<uint8_t> build_erc20_transfer(
     append_sel(r, SEL_ERC20_TRANSFER);
     append(r, abi_encode_address(to));
     append(r, abi_encode_uint256(amount));
+    return r;
+}
+
+// DelegateVoucherLogic: transferERC20(address token, address to, uint256 amount)
+static std::vector<uint8_t> build_delegate_erc20_transfer(
+    const std::string &token, const std::string &to, const std::string &amount)
+{
+    std::vector<uint8_t> r;
+    append_sel(r, SEL_DELEGATE_ERC20_TRANSFER);
+    append(r, abi_encode_address(token));
+    append(r, abi_encode_address(to));
+    append(r, abi_encode_uint256(amount));
+    return r;
+}
+
+// DelegateVoucherLogic: transferERC20Targeted(token, to, amount, allowedExecutor)
+static std::vector<uint8_t> build_delegate_erc20_targeted(
+    const std::string &token,
+    const std::string &to,
+    const std::string &amount,
+    const std::string &allowed_executor)
+{
+    std::vector<uint8_t> r;
+    append_sel(r, SEL_DELEGATE_ERC20_TARGETED);
+    append(r, abi_encode_address(token));
+    append(r, abi_encode_address(to));
+    append(r, abi_encode_uint256(amount));
+    append(r, abi_encode_address(allowed_executor));
     return r;
 }
 
@@ -301,6 +335,17 @@ static void emit_voucher(httplib::Client &cli,
     auto res = cli.Post("/voucher", body, "application/json");
     if (!res || res->status >= 400)
         std::cerr << "[voucher] emit failed\n";
+}
+
+static void emit_delegate_voucher(httplib::Client &cli,
+                                  const std::string &destination,
+                                  const std::string &payload_hex)
+{
+    std::string body = "{\"destination\":\"" + destination
+          + "\",\"payload\":\"" + payload_hex + "\"}";
+    auto res = cli.Post("/delegate-call-voucher", body, "application/json");
+    if (!res || res->status >= 400)
+        std::cerr << "[delegate-call-voucher] emit failed\n";
 }
 
 // =============================================================================
@@ -528,6 +573,33 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         emit_voucher(cli, token, bytes_to_hex(calldata));
         std::cout << "[advance] voucher: erc20_withdraw token=" << token
                   << " to=" << receiver << std::endl;
+        return "accept";
+    }
+
+    // delegate_erc20_transfer — DELEGATECALL voucher via DelegateVoucherLogic
+    if (cmd == "delegate_erc20_transfer") {
+        std::string logic    = input.get("logic").get<std::string>();
+        std::string token    = input.get("token").get<std::string>();
+        std::string receiver = input.get("receiver").get<std::string>();
+        std::string amount   = input.get("amount").get<std::string>();
+        auto calldata = build_delegate_erc20_transfer(token, receiver, amount);
+        emit_delegate_voucher(cli, logic, bytes_to_hex(calldata));
+        std::cout << "[advance] delegate-call-voucher: transferERC20 logic=" << logic
+                  << " token=" << token << " to=" << receiver << std::endl;
+        return "accept";
+    }
+
+    // delegate_erc20_transfer_targeted — only `allowedExecutor` may execute on L1
+    if (cmd == "delegate_erc20_transfer_targeted") {
+        std::string logic    = input.get("logic").get<std::string>();
+        std::string token    = input.get("token").get<std::string>();
+        std::string receiver = input.get("receiver").get<std::string>();
+        std::string amount   = input.get("amount").get<std::string>();
+        std::string allowed  = input.get("allowedExecutor").get<std::string>();
+        auto calldata = build_delegate_erc20_targeted(token, receiver, amount, allowed);
+        emit_delegate_voucher(cli, logic, bytes_to_hex(calldata));
+        std::cout << "[advance] delegate-call-voucher: transferERC20Targeted logic=" << logic
+                  << " allowedExecutor=" << allowed << std::endl;
         return "accept";
     }
 

@@ -22,6 +22,9 @@ const RPC_URL      = process.env.RPC_URL      || 'http://127.0.0.1:6751/anvil';
 const NODE_RPC_URL = process.env.NODE_RPC_URL || 'http://127.0.0.1:6751/rpc';
 const INSPECT_URL  = process.env.INSPECT_URL  || 'http://127.0.0.1:6751/inspect/tester';
 const PRIVATE_KEY  = process.env.PRIVATE_KEY  || '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+/** Second Anvil account — for negative tests (e.g. targeted voucher must revert). */
+const OTHER_PRIVATE_KEY = process.env.OTHER_PRIVATE_KEY
+  || '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
 // Contract addresses — stable for cartesi CLI local devnets
 const ADDR = {
@@ -36,12 +39,14 @@ const ADDR = {
   TEST_ERC721:          () => e('TEST_ERC721_ADDRESS'),
   TEST_ERC1155:         () => e('TEST_ERC1155_ADDRESS'),
   MINTABLE_ERC721:      () => e('MINTABLE_ERC721_ADDRESS'),
+  DELEGATE_VOUCHER_LOGIC: () => e('DELEGATE_VOUCHER_LOGIC_ADDRESS'),
 };
 
 // =============================================================================
 // CLIENTS
 // =============================================================================
 const account = privateKeyToAccount(PRIVATE_KEY);
+const accountOther = privateKeyToAccount(OTHER_PRIVATE_KEY);
 
 // L1 public client — getCode, getBlockNumber, waitForTransactionReceipt, validateOutput, etc.
 const publicClient = createPublicClient({
@@ -56,12 +61,20 @@ const walletClient = createWalletClient({
   transport: http(RPC_URL),
 }).extend(walletActionsL1());
 
+const walletClientOther = createWalletClient({
+  chain: foundry,
+  account: accountOther,
+  transport: http(RPC_URL),
+}).extend(walletActionsL1());
+
 // L2 Cartesi node client — waitForInput, listOutputs, listReports, getNodeVersion
 const publicClientL2 = createCartesiPublicClient({
   transport: http(NODE_RPC_URL),
 });
 
 const deployer = account.address;
+/** Address of `OTHER_PRIVATE_KEY` — use as non-targeted executor in tests. */
+const otherUser = accountOther.address;
 
 // =============================================================================
 // ADVANCE INPUT — send JSON as hex-encoded payload
@@ -402,9 +415,11 @@ async function getOutputWithProof(outputIndex, timeoutMs = 60_000) {
  * Execute a voucher on L1 (calls the application's executeOutput).
  * Returns the transaction receipt.
  * @param {object} output  — full Output object with proof
+ * @param {{ walletClient?: import('viem').WalletClient }} [opts]  — optional signer (default: deployer)
  */
-async function executeVoucher(output) {
-  const hash    = await walletClient.executeOutput({ application: ADDR.APP(), output });
+async function executeVoucher(output, opts = {}) {
+  const wc = opts.walletClient ?? walletClient;
+  const hash = await wc.executeOutput({ application: ADDR.APP(), output });
   return publicClient.waitForTransactionReceipt({ hash });
 }
 
@@ -427,9 +442,11 @@ const uint256hex = (v) => toHex(BigInt(v), { size: 32 });
 export {
   ADDR,
   deployer,
+  otherUser,
   publicClient,
   publicClientL2,
   walletClient,
+  walletClientOther,
   sendAdvance,
   sendRawInput,
   pollInput,

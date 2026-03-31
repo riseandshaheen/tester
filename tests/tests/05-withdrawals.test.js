@@ -8,6 +8,8 @@
  *   erc721_withdraw       → ERC721 token contract (safeTransferFrom)
  *   erc1155_withdraw_*    → ERC1155 token contract (safeTransferFrom / safeBatchTransferFrom)
  *   mint_erc721           → MintableERC721 contract (mint to receiver)
+ *   delegate_erc20_transfer → DelegateVoucherLogic (DELEGATECALL voucher; ERC20 transfer)
+ *   delegate_erc20_transfer_targeted → same + only allowedExecutor may execute on L1
  */
 
 import { parseEther } from 'viem';
@@ -96,5 +98,36 @@ describe('Withdrawals', () => {
     expect(input.status).toBe('ACCEPTED');
     expect(voucherCount(input)).toBe(1);
     expect(voucherDest(input, 0)).toBe(ADDR.MINTABLE_ERC721().toLowerCase());
+  });
+
+  test('delegate_erc20_transfer — ACCEPTED, DelegateCallVoucher to logic contract', async () => {
+    const idx = await sendAdvance({
+      cmd:      'delegate_erc20_transfer',
+      logic:    ADDR.DELEGATE_VOUCHER_LOGIC(),
+      token:    ADDR.TEST_ERC20(),
+      receiver: deployer,
+      amount:   uint256hex(parseEther('1')),
+    });
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    expect(voucherCount(input)).toBe(1);
+    expect(input.vouchers[0]?.decodedData?.type).toBe('DelegateCallVoucher');
+    expect(voucherDest(input, 0)).toBe(ADDR.DELEGATE_VOUCHER_LOGIC().toLowerCase());
+  });
+
+  test('delegate_erc20_transfer_targeted — ACCEPTED, DelegateCallVoucher', async () => {
+    const idx = await sendAdvance({
+      cmd:              'delegate_erc20_transfer_targeted',
+      logic:            ADDR.DELEGATE_VOUCHER_LOGIC(),
+      token:            ADDR.TEST_ERC20(),
+      receiver:         deployer,
+      amount:           uint256hex(parseEther('1')),
+      allowedExecutor:  deployer,
+    });
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    expect(voucherCount(input)).toBe(1);
+    expect(input.vouchers[0]?.decodedData?.type).toBe('DelegateCallVoucher');
+    expect(voucherDest(input, 0)).toBe(ADDR.DELEGATE_VOUCHER_LOGIC().toLowerCase());
   });
 });

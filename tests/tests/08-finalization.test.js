@@ -7,7 +7,7 @@
  *
  * Flow:
  *   1. Deposit fresh assets for each withdrawal type
- *   2. Send withdrawal + notice commands — capture output indices
+ *   2. Send withdrawal + notice commands (incl. delegate_erc20_transfer) — capture output indices
  *   3. Mine EPOCH_LENGTH+1 blocks to close the epoch
  *   4. Wait until the node's epoch is CLAIM_ACCEPTED, then fetch outputs (proofs attached)
  *   5. Execute vouchers → assert L1 balances changed
@@ -17,13 +17,14 @@
 import { parseAbi, parseEther } from 'viem';
 
 import {
-  ADDR, deployer,
+  ADDR, deployer, otherUser,
   publicClient, publicClientL2,
   sendAdvance, pollInput,
   mineBlocks, waitForEpochClaimAccepted, getOutputWithProof,
   executeVoucher, validateNotice,
   depositEth, depositERC20, depositERC721,
   depositERC1155Single, depositERC1155Batch,
+  walletClientOther,
   uint256hex,
 } from '../helpers.js';
 
@@ -42,6 +43,7 @@ const ctx = {
   noticeOutput:   null, // Output (Notice) with proof
   ethOutput:      null, // Voucher outputs with proofs
   erc20Output:    null,
+  delegateOutput: null,
   erc721Output:   null,
   erc1155SOutput: null,
   erc1155BOutput: null,
@@ -60,11 +62,18 @@ beforeAll(async () => {
   await depositERC1155Single(ADDR.TEST_ERC1155(), 1n, 100n);
   await depositERC1155Batch(ADDR.TEST_ERC1155(), [1n, 2n], [50n, 50n]);
 
-  // ── 2. Advance commands — notice + all 6 withdrawal types ─────────────────
+  // ── 2. Advance commands — notice + withdrawals (incl. delegate ERC-20) ─────
   // Must be sequential to avoid nonce collisions on Anvil
   const noticeIdx    = await sendAdvance({ cmd: 'generate_notices', size: 32, count: 1 });
   const ethIdx       = await sendAdvance({ cmd: 'eth_withdraw',        receiver: deployer, amount: uint256hex(parseEther('0.1')) });
   const erc20Idx     = await sendAdvance({ cmd: 'erc20_withdraw',      token: ADDR.TEST_ERC20(),   receiver: deployer, amount: uint256hex(parseEther('10')) });
+  const delegateIdx  = await sendAdvance({
+    cmd:      'delegate_erc20_transfer',
+    logic:    ADDR.DELEGATE_VOUCHER_LOGIC(),
+    token:    ADDR.TEST_ERC20(),
+    receiver: deployer,
+    amount:   uint256hex(parseEther('5')),
+  });
   const erc721Idx    = await sendAdvance({ cmd: 'erc721_withdraw',     token: ADDR.TEST_ERC721(),  receiver: deployer, tokenId: uint256hex(2n) });
   const erc1155SIdx  = await sendAdvance({ cmd: 'erc1155_withdraw_single', token: ADDR.TEST_ERC1155(), receiver: deployer, id: uint256hex(1n), amount: uint256hex(25n) });
   const erc1155BIdx  = await sendAdvance({ cmd: 'erc1155_withdraw_batch',  token: ADDR.TEST_ERC1155(), receiver: deployer, ids: [uint256hex(1n), uint256hex(2n)], amounts: [uint256hex(5n), uint256hex(10n)] });
@@ -75,6 +84,7 @@ beforeAll(async () => {
     noticeInput,
     ethInput,
     erc20Input,
+    delegateInput,
     erc721Input,
     erc1155SInput,
     erc1155BInput,
@@ -83,6 +93,7 @@ beforeAll(async () => {
     pollInput(noticeIdx),
     pollInput(ethIdx),
     pollInput(erc20Idx),
+    pollInput(delegateIdx),
     pollInput(erc721Idx),
     pollInput(erc1155SIdx),
     pollInput(erc1155BIdx),
@@ -92,6 +103,7 @@ beforeAll(async () => {
   if (noticeInput.status !== 'ACCEPTED')   throw new Error('notice generate not ACCEPTED');
   if (ethInput.status !== 'ACCEPTED')      throw new Error('eth_withdraw not ACCEPTED');
   if (erc20Input.status !== 'ACCEPTED')    throw new Error('erc20_withdraw not ACCEPTED');
+  if (delegateInput.status !== 'ACCEPTED') throw new Error('delegate_erc20_transfer not ACCEPTED');
   if (erc721Input.status !== 'ACCEPTED')   throw new Error('erc721_withdraw not ACCEPTED');
   if (erc1155SInput.status !== 'ACCEPTED') throw new Error('erc1155_withdraw_single not ACCEPTED');
   if (erc1155BInput.status !== 'ACCEPTED') throw new Error('erc1155_withdraw_batch not ACCEPTED');
@@ -104,6 +116,7 @@ beforeAll(async () => {
   const noticeRaw   = noticeInput.notices[0];
   const ethRaw      = ethInput.vouchers[0];
   const erc20Raw    = erc20Input.vouchers[0];
+  const delegateRaw = delegateInput.vouchers[0];
   const erc721Raw   = erc721Input.vouchers[0];
   const erc1155SRaw = erc1155SInput.vouchers[0];
   const erc1155BRaw = erc1155BInput.vouchers[0];
@@ -113,6 +126,7 @@ beforeAll(async () => {
     noticeInput.epochIndex,
     ethInput.epochIndex,
     erc20Input.epochIndex,
+    delegateInput.epochIndex,
     erc721Input.epochIndex,
     erc1155SInput.epochIndex,
     erc1155BInput.epochIndex,
@@ -125,6 +139,7 @@ beforeAll(async () => {
     ctx.noticeOutput,
     ctx.ethOutput,
     ctx.erc20Output,
+    ctx.delegateOutput,
     ctx.erc721Output,
     ctx.erc1155SOutput,
     ctx.erc1155BOutput,
@@ -133,6 +148,7 @@ beforeAll(async () => {
     getOutputWithProof(noticeRaw.index),
     getOutputWithProof(ethRaw.index),
     getOutputWithProof(erc20Raw.index),
+    getOutputWithProof(delegateRaw.index),
     getOutputWithProof(erc721Raw.index),
     getOutputWithProof(erc1155SRaw.index),
     getOutputWithProof(erc1155BRaw.index),
@@ -174,6 +190,17 @@ describe('Voucher execution (L1 balance checks)', () => {
     expect(after - ctx.erc20Before).toBe(parseEther('10'));
   });
 
+  test('delegate_erc20_transfer — ERC20 balance increases by 5 tokens after execution', async () => {
+    const before = await publicClient.readContract({
+      address: ADDR.TEST_ERC20(), abi: ERC20_ABI, functionName: 'balanceOf', args: [deployer],
+    });
+    await executeVoucher(ctx.delegateOutput);
+    const after = await publicClient.readContract({
+      address: ADDR.TEST_ERC20(), abi: ERC20_ABI, functionName: 'balanceOf', args: [deployer],
+    });
+    expect(after - before).toBe(parseEther('5'));
+  });
+
   test('erc721_withdraw — tokenId=2 ownerOf is deployer after execution', async () => {
     await executeVoucher(ctx.erc721Output);
     const owner = await publicClient.readContract({
@@ -212,6 +239,47 @@ describe('Voucher execution (L1 balance checks)', () => {
       address: ADDR.MINTABLE_ERC721(), abi: ERC721_ABI, functionName: 'ownerOf', args: [200n],
     });
     expect(owner.toLowerCase()).toBe(deployer.toLowerCase());
+  });
+});
+
+// =============================================================================
+// Targeted delegate voucher — only `allowedExecutor` may call executeOutput
+// =============================================================================
+const ctxTargeted = { output: null };
+
+describe('Targeted delegate voucher (executor must match allowedExecutor)', () => {
+  beforeAll(async () => {
+    await depositERC20(ADDR.TEST_ERC20(), parseEther('10'));
+    const idx = await sendAdvance({
+      cmd:              'delegate_erc20_transfer_targeted',
+      logic:            ADDR.DELEGATE_VOUCHER_LOGIC(),
+      token:            ADDR.TEST_ERC20(),
+      receiver:         deployer,
+      amount:           uint256hex(parseEther('3')),
+      allowedExecutor:  deployer,
+    });
+    const input = await pollInput(idx);
+    if (input.status !== 'ACCEPTED') throw new Error('delegate_erc20_transfer_targeted not ACCEPTED');
+    await mineBlocks(EPOCH_LENGTH + 2);
+    await waitForEpochClaimAccepted(input.epochIndex);
+    ctxTargeted.output = await getOutputWithProof(input.vouchers[0].index);
+  }, 600_000);
+
+  test('non-targeted account — executeOutput reverts', async () => {
+    expect(otherUser.toLowerCase()).not.toBe(deployer.toLowerCase());
+    const execution = executeVoucher(ctxTargeted.output, { walletClient: walletClientOther });
+    await expect(execution).rejects.toThrow();
+  });
+
+  test('allowedExecutor — executeOutput succeeds and transfers ERC20', async () => {
+    const before = await publicClient.readContract({
+      address: ADDR.TEST_ERC20(), abi: ERC20_ABI, functionName: 'balanceOf', args: [deployer],
+    });
+    await executeVoucher(ctxTargeted.output);
+    const after = await publicClient.readContract({
+      address: ADDR.TEST_ERC20(), abi: ERC20_ABI, functionName: 'balanceOf', args: [deployer],
+    });
+    expect(after - before).toBe(parseEther('3'));
   });
 });
 

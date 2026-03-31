@@ -5,7 +5,8 @@ import {Script, console} from "forge-std/Script.sol";
 import {TestERC20}      from "../src/TestERC20.sol";
 import {TestERC721}     from "../src/TestERC721.sol";
 import {TestERC1155}    from "../src/TestERC1155.sol";
-import {MintableERC721} from "../src/MintableERC721.sol";
+import {MintableERC721}      from "../src/MintableERC721.sol";
+import {DelegateVoucherLogic} from "../src/DelegateVoucherLogic.sol";
 
 /// @notice Deploys the three test-specific token contracts and wires up roles.
 ///
@@ -13,7 +14,8 @@ import {MintableERC721} from "../src/MintableERC721.sol";
 /// TestMultiToken (ERC1155) — this script only deploys what those don't cover:
 ///   • TestERC721    — mintable ERC721 we fully control (token IDs 1-5 pre-minted)
 ///   • TestERC1155   — mintable ERC1155 with TOKEN_A/B/C/D pre-minted
-///   • MintableERC721 — ERC721 gated by MINTER_ROLE (for voucher-mint tests)
+///   • MintableERC721      — ERC721 gated by MINTER_ROLE (for voucher-mint tests)
+///   • DelegateVoucherLogic — no-storage helper for DELEGATECALL voucher tests
 ///
 /// Required env vars:
 ///   CARTESI_APP_ADDRESS  — shown by `cartesi run` or `cartesi address-book`
@@ -32,7 +34,8 @@ contract Deploy is Script {
         TestERC20      erc20   = new TestERC20();
         TestERC721     nft721  = new TestERC721();
         TestERC1155    nft1155 = new TestERC1155();
-        MintableERC721 mintNft = new MintableERC721();
+        MintableERC721      mintNft   = new MintableERC721();
+        DelegateVoucherLogic delLogic = new DelegateVoucherLogic();
 
         // Grant the Cartesi app the right to call mintNft.mint() via vouchers
         mintNft.grantMinterRole(cartesiApp);
@@ -48,7 +51,8 @@ contract Deploy is Script {
         console.log("TestERC20:     ", address(erc20));
         console.log("TestERC721:    ", address(nft721));
         console.log("TestERC1155:   ", address(nft1155));
-        console.log("MintableERC721:", address(mintNft));
-        console.log("Cartesi app:   ", cartesiApp);
+        console.log("MintableERC721:      ", address(mintNft));
+        console.log("DelegateVoucherLogic:", address(delLogic));
+        console.log("Cartesi app:         ", cartesiApp);
     }
 }
