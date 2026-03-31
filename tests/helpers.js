@@ -144,6 +144,16 @@ async function pollInput(index, timeoutMs = 90_000) {
     throw new Error(`Input ${index} timed out after ${timeoutMs}ms`);
   }
 
+  if (inputResult.status === 'EXCEPTION') {
+    return {
+      status:     'EXCEPTION',
+      epochIndex: inputResult.epochIndex,
+      notices:    [],
+      reports:    [],
+      vouchers:   [],
+    };
+  }
+
   const [outputsResult, reportsResult] = await Promise.all([
     publicClientL2.listOutputs({ application: app, inputIndex: bigIdx }),
     publicClientL2.listReports({ application: app, inputIndex: bigIdx }),
@@ -262,6 +272,27 @@ async function depositERC20(tokenAddr, amount) {
     token:         tokenAddr,
     amount,
     execLayerData: '0x',
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
+/** ERC-20 deposit with non-empty `execLayerData` (ABI-encoded bytes on the portal). */
+async function depositERC20WithExecLayer(tokenAddr, amount, execLayerDataHex) {
+  const approveHash = await walletClient.writeContract({
+    address:      tokenAddr,
+    abi:          ERC20_ABI,
+    functionName: 'approve',
+    args:         [ADDR.ERC20_PORTAL, amount],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  const hash = await walletClient.depositERC20Tokens({
+    application:   ADDR.APP(),
+    token:         tokenAddr,
+    amount,
+    execLayerData: execLayerDataHex,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   const [inputAdded] = getInputsAdded(receipt);
@@ -461,7 +492,7 @@ export {
   voucherDest,
   sendInspect,
   inspectReportCount, inspectReportBytes,
-  depositEth, depositERC20, depositERC721,
+  depositEth, depositERC20, depositERC20WithExecLayer, depositERC721,
   depositERC1155Single, depositERC1155Batch,
   uint256hex,
   sleep,

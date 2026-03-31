@@ -1,6 +1,12 @@
 # Cartesi Test DApp
 
-A C++ Cartesi v2 dapp for exercising all rollup primitives: every deposit type, every withdrawal type (via vouchers), configurable notice/report generation, and an ERC721 voucher-mint flow.
+A C++ Cartesi v2 dapp for exercising all rollup primitives: every deposit type, every withdrawal type (via vouchers), delegate-call vouchers, configurable notice/report generation, exception registration, mixed outputs per advance, and an ERC721 voucher-mint flow. Integration tests cover JSON-RPC pagination, ERC-20 `execLayerData` deposits (Rollups v2 `InputEncoding` packed payload), large vouchers, and multi-voucher L1 ordering.
+
+After changing **`dapp.cpp`**, rebuild the binary before `cartesi build`:
+
+```bash
+make    # repo root — produces ./dapp
+```
 
 ---
 
@@ -53,14 +59,14 @@ private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 | Node JSON-RPC | `http://127.0.0.1:6751/rpc` |
 | Inspect REST | `http://127.0.0.1:6751/inspect/<dapp-name>` |
 
-For suites 00–07 (no voucher execution), the default epoch length is fine:
+For suites **00–07** only, the default epoch length is fine:
 
 ```bash
 cartesi build
 cartesi run
 ```
 
-For suite 08 (voucher execution + notice validation on L1) you need a short epoch so proofs are available quickly:
+Suite **08** (L1 proofs + voucher execution) and the **last test block in 09** (`multi_erc20_withdraw` on L1) need a **short epoch** and matching proofs. For **full `npm test`**, use a short `--epoch-length` and set **`EPOCH_LENGTH`** in `.env` to the same value:
 
 ```bash
 cartesi run --epoch-length 5
@@ -100,11 +106,14 @@ Note the contract addresses printed at the end:
 
 ```
 === Deployed ===
-TestERC20:      0x...
-TestERC721:     0x...
-TestERC1155:    0x...
-MintableERC721: 0x...
+TestERC20:              0x...
+TestERC721:             0x...
+TestERC1155:            0x...
+MintableERC721:         0x...
+DelegateVoucherLogic:   0x...
 ```
+
+`Deploy.s.sol` grants the Cartesi app `MINTER_ROLE` on `MintableERC721` so `mint_erc721` vouchers can mint at L1 execution time.
 
 ### 3 — Configure the test suite
 
@@ -113,19 +122,21 @@ cd tests
 cp .env.example .env
 ```
 
-Update `.env` with the addresses from above. The key variables are:
+Update `.env` with the addresses from above (see **`.env.example`** for the full list). The key variables are:
 
 | Variable | Description | Source |
 |---|---|---|
 | `CARTESI_APP_ADDRESS` | App contract from `cartesi run` output | From `cartesi run` |
-| `ERC20_ADDRESS` | TestERC20 contract | From `forge script Deploy` |
-| `ERC721_ADDRESS` | TestERC721 contract | From `forge script Deploy` |
-| `ERC1155_ADDRESS` | TestERC1155 contract | From `forge script Deploy` |
-| `MINTABLE_ERC721_ADDRESS` | MintableERC721 contract | From `forge script Deploy` |
+| `TEST_ERC20_ADDRESS` | TestERC20 | From `forge script Deploy` |
+| `TEST_ERC721_ADDRESS` | TestERC721 | From `forge script Deploy` |
+| `TEST_ERC1155_ADDRESS` | TestERC1155 | From `forge script Deploy` |
+| `MINTABLE_ERC721_ADDRESS` | MintableERC721 | From `forge script Deploy` |
+| `DELEGATE_VOUCHER_LOGIC_ADDRESS` | DelegateCall voucher helper | From `forge script Deploy` |
 | `RPC_URL` | Anvil RPC | Default: `http://127.0.0.1:6751/anvil` |
 | `NODE_RPC_URL` | Cartesi node JSON-RPC | Default: `http://127.0.0.1:6751/rpc` |
-| `INSPECT_URL` | Cartesi inspect REST | Default: `http://127.0.0.1:6751/inspect/tester` |
-| `EPOCH_LENGTH` | Must match `--epoch-length` flag | Default: `5` |
+| `INSPECT_URL` | Inspect REST — **must include your dapp name**, e.g. `…/inspect/tester` | Default: `http://127.0.0.1:6751/inspect/tester` |
+| `PRIVATE_KEY` / `OTHER_PRIVATE_KEY` | Anvil accounts — second key used for targeted delegate-voucher negative tests | See `.env.example` |
+| `EPOCH_LENGTH` | Must match `cartesi run --epoch-length` | Default in example: `5`; align with your CLI |
 
 ### 4 — Install dependencies and run
 
@@ -150,12 +161,13 @@ npx jest --runInBand tests/01-deposits.test.js
 | `00-preflight` | Node reachability, Anvil RPC, all contracts deployed |
 | `01-deposits` | All 5 portal deposit types — verifies ACCEPTED + notice |
 | `02-setup` | `set_mint_contract` — registers MintableERC721 address |
-| `03-notices` | Notice size limits: 1 KB, 1 MB, 3×100 KB, exact 2 MB (accepted), 2 MB+1 (rejected) |
+| `03-notices` | Notice size limits: 1 KB, 1 MB, 3×100 KB, ~1.85 MB under 2 MB cap, 2 MB+1 (rejected). See **Troubleshooting** — the ~1.85 MB advance case can be flaky (`EXCEPTION` vs `ACCEPTED`). |
 | `04-reports` | Inspect/report size limits: same cases, silently dropped above 2 MB |
-| `05-withdrawals` | All 5 withdrawal voucher types + `mint_erc721` — verifies voucher created on L2 |
+| `05-withdrawals` | All 5 withdrawal voucher types + `mint_erc721` + delegate ERC20 vouchers — verifies voucher created on L2 |
 | `06-overdrafts` | Withdrawals without matching deposits — advance ACCEPTED, voucher emitted (L1 would revert) |
 | `07-errors` | Invalid JSON, unknown cmd, unknown inspect cmd |
-| `08-finalization` | **Requires `--epoch-length 5`** — mines epoch, validates notice proof on L1, executes all 6 vouchers and checks L1 balances |
+| `08-finalization` | **Requires short epoch** (same `--epoch-length` as `EPOCH_LENGTH` in `.env`) — notice proof on L1, voucher execution + balances, delegate vouchers (including targeted executor), overdraft execution reverts |
+| `09-rollups-expanded-coverage` | Exceptions, reports during advance, mixed outputs, JSON-RPC listing/filter/count, ERC-20 voucher `valueField` shapes, ERC-20 deposit with `execLayerData`, large vouchers; **last block** runs two ERC-20 vouchers on L1 in order (**needs short epoch**, same as suite 08) |
 
 ---
 
@@ -185,6 +197,46 @@ Generate N notices of a given byte size. Sizes up to **2,097,152 bytes (2 MB)** 
 
 ---
 
+#### `force_exception`
+Registers an **exception** for the current input (HTTP `POST` to the rollup **`/exception`** endpoint). The input finishes with status **`EXCEPTION`** (not `ACCEPTED`).
+```json
+{"cmd":"force_exception","message":"optional reason"}
+```
+
+---
+
+#### `advance_reports`
+Emit reports during an advance (same machine cycle), for testing report linkage to the active input.
+```json
+{"cmd":"advance_reports","size":1024,"count":2}
+```
+
+---
+
+#### `mixed_outputs`
+Emit a notice, a report, and a voucher in one advance (optional `noticeText`, `reportText`).
+```json
+{"cmd":"mixed_outputs","token":"0x...","receiver":"0x...","amount":"0x...","noticeText":"hello","reportText":"log"}
+```
+
+---
+
+#### `multi_erc20_withdraw`
+Emit **two** ERC-20 transfer vouchers in one advance (tests L1 execution order).
+```json
+{"cmd":"multi_erc20_withdraw","token":"0x...","receiver":"0x...","amountFirst":"0x...","amountSecond":"0x..."}
+```
+
+---
+
+#### `large_voucher`
+Emit a voucher with a large arbitrary `payload` (tests calldata size limits). May **reject** the advance if the payload exceeds limits.
+```json
+{"cmd":"large_voucher","destination":"0x...","payloadBytes":204800}
+```
+
+---
+
 #### `eth_withdraw`
 Emit a voucher calling `EtherPortal.withdrawEther(receiver, amount)`.
 ```json
@@ -195,8 +247,22 @@ Emit a voucher calling `EtherPortal.withdrawEther(receiver, amount)`.
 
 #### `erc20_withdraw`
 Emit a voucher calling `token.transfer(receiver, amount)`.
+
+Optional **`valueField`** (for encoding experiments): `"omit"` (no `value` field on the voucher) or `"zero_hash"` (`bytes32(0)`).
 ```json
 {"cmd":"erc20_withdraw","token":"0x...","receiver":"0x...","amount":"0x<uint256>"}
+```
+
+---
+
+#### `delegate_erc20_transfer` / `delegate_erc20_transfer_targeted`
+Emit a **DelegateCallVoucher** that delegate-calls `DelegateVoucherLogic` to perform `transfer` on the ERC-20 token. The **targeted** variant includes `allowedExecutor`; only that address may execute the voucher on L1.
+
+```json
+{"cmd":"delegate_erc20_transfer","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x..."}
+```
+```json
+{"cmd":"delegate_erc20_transfer_targeted","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x...","allowedExecutor":"0x..."}
 ```
 
 ---
@@ -262,10 +328,14 @@ Deposits are triggered on-chain via the portal contracts. The dapp detects them 
 | Deposit | Notice payload (decoded) |
 |---|---|
 | ETH | `ETH OK` |
-| ERC20 | `ERC20 OK` |
+| ERC20 | `ERC20 OK`, or `ERC20 OK exec=0x…` when `execLayerData` is non-empty (hex of raw exec bytes) |
 | ERC721 | `ERC721 OK` |
 | ERC1155 single | `1155S OK` |
 | ERC1155 batch | `1155B OK` |
+
+### ERC-20 payload encoding (Rollups v2)
+
+On-chain, [`InputEncoding.encodeERC20Deposit`](https://github.com/cartesi/rollups-contracts/blob/v2.0.1/src/common/InputEncoding.sol) uses **`abi.encodePacked`**: `token` (20 B) + `sender` (20 B) + `value` (32 B) + **`execLayerData`** (raw bytes). The dapp decodes **`execLayerData`** from byte offset **72** onward — not standard `abi.encode` with a dynamic offset.
 
 ### Note on withdrawals and balance tracking
 
@@ -280,6 +350,12 @@ The test suite verifies:
 ---
 
 ## Troubleshooting
+
+### Suite `03-notices`: ~1.85 MB case sometimes returns `EXCEPTION`
+
+The test **“1 notice of 1.85 MB (under 2 MB limit) — accepted”** occasionally sees input status **`EXCEPTION`** instead of **`ACCEPTED`**, while smaller notices and the similar-sized **inspect** report in `04-reports` still pass. This looks like **advance-path** limits or stability, not a wrong assertion in the size math.
+
+Tracked in [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). Mitigations: fresh `cartesi run`, retry the suite, or align machine/node resources if you control them.
 
 ### `forge script` fails with "environment variable not found"
 

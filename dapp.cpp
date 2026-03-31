@@ -12,6 +12,12 @@
 //   {"cmd":"mint_erc721","receiver":"0x...","tokenId":"0x<uint256>"}
 //   {"cmd":"delegate_erc20_transfer","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>"}
 //   {"cmd":"delegate_erc20_transfer_targeted","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>","allowedExecutor":"0x..."}
+//   {"cmd":"force_exception","message":"..."}   → POST /exception (input status EXCEPTION)
+//   {"cmd":"advance_reports","size":<bytes>,"count":<n>}
+//   {"cmd":"mixed_outputs","token":"0x...","receiver":"0x...","amount":"0x...", optional noticeText, reportText}
+//   {"cmd":"multi_erc20_withdraw","token":"0x...","receiver":"0x...","amountFirst":"0x...","amountSecond":"0x..."}
+//   {"cmd":"large_voucher","destination":"0x...","payloadBytes":<n>}
+//   erc20_withdraw optional: "valueField":"omit"|"zero_hash"
 //
 // Deposits are auto-detected by msg_sender matching portal addresses.
 //
@@ -317,7 +323,7 @@ static bool emit_report(httplib::Client &cli, const std::string &payload_hex) {
     return true;
 }
 
-static void emit_voucher(httplib::Client &cli,
+static bool emit_voucher(httplib::Client &cli,
                          const std::string &destination,
                          const std::string &payload_hex,
                          const std::string &value_hex = "")
@@ -333,8 +339,11 @@ static void emit_voucher(httplib::Client &cli,
               + "\",\"value\":\"0x" + value_hex + "\"}";  
     }
     auto res = cli.Post("/voucher", body, "application/json");
-    if (!res || res->status >= 400)
+    if (!res || res->status >= 400) {
         std::cerr << "[voucher] emit failed\n";
+        return false;
+    }
+    return true;
 }
 
 static void emit_delegate_voucher(httplib::Client &cli,
@@ -348,10 +357,22 @@ static void emit_delegate_voucher(httplib::Client &cli,
         std::cerr << "[delegate-call-voucher] emit failed\n";
 }
 
+// Register EXCEPTION for the current input (must be last rollup HTTP call in handler).
+static bool emit_exception(httplib::Client &cli, const std::string &payload_hex) {
+    std::string body = "{\"payload\":\"" + payload_hex + "\"}";
+    auto res = cli.Post("/exception", body, "application/json");
+    if (!res || res->status < 200 || res->status >= 300) {
+        std::cerr << "[exception] emit failed (status="
+                  << (res ? std::to_string(res->status) : "no response") << ")\n";
+        return false;
+    }
+    return true;
+}
+
 // =============================================================================
 // DEPOSIT PARSERS
-// Portals encode their payloads with abi.encode(), producing 32-byte aligned words.
-// Each parser reads at fixed word offsets and logs the decoded fields.
+// Rollups v2 InputEncoding: ERC20 uses abi.encodePacked (20+20+32+exec); others
+// below use standard abi.encode or packed layouts as in rollups-contracts.
 // =============================================================================
 
 static std::vector<uint8_t> abi_word_at(const std::vector<uint8_t> &data, size_t offset) {
@@ -384,14 +405,20 @@ static void parse_eth_deposit(const std::vector<uint8_t> &p) {
               << " value="     << word_to_uint256(abi_word_at(p, 32)) << std::endl;
 }
 
-// ERC20: abi.encode(bool success, address token, address depositor, uint256 amount, bytes execLayerData)
+// ERC20: InputEncoding.encodeERC20Deposit (rollups-contracts v2) —
+//   abi.encodePacked(token 20B, sender 20B, value 32B, execLayerData)
 static void parse_erc20_deposit(const std::vector<uint8_t> &p) {
-    if (p.size() < 128) { std::cerr << "[ERC20 deposit] payload too short\n"; return; }
+    if (p.size() < 72) { std::cerr << "[ERC20 deposit] payload too short\n"; return; }
     std::cout << "[ERC20 deposit]"
-              << " success="  << (p[31] ? "true" : "false")
-              << " token="    << word_to_addr(abi_word_at(p, 32))
-              << " depositor="<< word_to_addr(abi_word_at(p, 64))
-              << " amount="   << word_to_uint256(abi_word_at(p, 96)) << std::endl;
+              << " token="    << bytes_to_hex(std::vector<uint8_t>(p.begin(), p.begin() + 20))
+              << " depositor="<< bytes_to_hex(std::vector<uint8_t>(p.begin() + 20, p.begin() + 40))
+              << " amount="   << word_to_uint256(abi_word_at(p, 40)) << std::endl;
+}
+
+// execLayerData is concatenated after the 72-byte fixed prefix (no ABI length prefix).
+static std::string decode_erc20_exec_layer_hex(const std::vector<uint8_t> &p) {
+    if (p.size() <= 72) return "";
+    return bytes_to_hex(std::vector<uint8_t>(p.begin() + 72, p.end()));
 }
 
 // ERC721: abi.encode(address token, address sender, uint256 tokenId, bytes baseLayerData, bytes execLayerData)
@@ -487,7 +514,13 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
     }
     if (msg_sender == ADDR_ERC20_PORTAL) {
         parse_erc20_deposit(raw);
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>({'E','R','C','2','0',' ','O','K'})));
+        std::string exec_hex = decode_erc20_exec_layer_hex(raw);
+        std::string ack = "ERC20 OK";
+        if (!exec_hex.empty()) {
+            ack += " exec=";
+            ack += exec_hex;
+        }
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
         return "accept";
     }
     if (msg_sender == ADDR_ERC721_PORTAL) {
@@ -548,6 +581,76 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         return "accept";
     }
 
+    // force_exception — POST /exception; input completes as EXCEPTION (last HTTP call)
+    if (cmd == "force_exception") {
+        std::string msg = input.contains("message")
+            ? input.get("message").get<std::string>()
+            : std::string("test_exception");
+        std::vector<uint8_t> mb(msg.begin(), msg.end());
+        if (!emit_exception(cli, bytes_to_hex(mb))) return "reject";
+        std::cout << "[advance] registered exception payload len=" << mb.size() << std::endl;
+        return "accept";
+    }
+
+    // advance_reports — emit /report during an advance (same limits as notices)
+    if (cmd == "advance_reports") {
+        size_t sz    = (size_t)input.get("size").get<double>();
+        size_t count = (size_t)input.get("count").get<double>();
+        std::string payload = make_payload(sz);
+        for (size_t i = 0; i < count; i++) {
+            if (!emit_report(cli, payload)) {
+                std::cerr << "[advance] report " << i << " rejected\n";
+                return "reject";
+            }
+        }
+        return "accept";
+    }
+
+    // mixed_outputs — one notice + one report + one ERC-20 voucher in a single advance
+    if (cmd == "mixed_outputs") {
+        std::string token    = input.get("token").get<std::string>();
+        std::string receiver = input.get("receiver").get<std::string>();
+        std::string amount   = input.get("amount").get<std::string>();
+        std::string ntxt     = input.contains("noticeText")
+            ? input.get("noticeText").get<std::string>()
+            : std::string("MIXED_OK");
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ntxt.begin(), ntxt.end())));
+        std::string rtxt = input.contains("reportText")
+            ? input.get("reportText").get<std::string>()
+            : std::string("mixed_report");
+        emit_report(cli, bytes_to_hex(std::vector<uint8_t>(rtxt.begin(), rtxt.end())));
+        auto calldata = build_erc20_transfer(receiver, amount);
+        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        std::cout << "[advance] mixed_outputs notice+report+voucher\n";
+        return "accept";
+    }
+
+    // multi_erc20_withdraw — two ERC-20 vouchers in one advance (execution order on L1)
+    if (cmd == "multi_erc20_withdraw") {
+        std::string token     = input.get("token").get<std::string>();
+        std::string receiver  = input.get("receiver").get<std::string>();
+        std::string amount_a  = input.get("amountFirst").get<std::string>();
+        std::string amount_b  = input.get("amountSecond").get<std::string>();
+        (void)emit_voucher(cli, token, bytes_to_hex(build_erc20_transfer(receiver, amount_a)));
+        (void)emit_voucher(cli, token, bytes_to_hex(build_erc20_transfer(receiver, amount_b)));
+        std::cout << "[advance] multi_erc20_withdraw two vouchers\n";
+        return "accept";
+    }
+
+    // large_voucher — single voucher with near–2 MB calldata (rollup output size limit)
+    if (cmd == "large_voucher") {
+        std::string dest = input.get("destination").get<std::string>();
+        size_t sz        = (size_t)input.get("payloadBytes").get<double>();
+        if (sz > 2100000) {
+            std::cerr << "[advance] large_voucher payload too large\n";
+            return "reject";
+        }
+        std::string payload = make_payload(sz);
+        if (!emit_voucher(cli, dest, payload)) return "reject";
+        std::cout << "[advance] large_voucher bytes=" << sz << std::endl;
+        return "accept";
+    }
+
     // eth_withdraw ───────────────────────────────────────────────────────────
     // v2: destination=receiver, payload=0x (empty), value=amount as 64-char hex
     if (cmd == "eth_withdraw") {
@@ -558,21 +661,28 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         if (amt_hex.size() >= 2 && amt_hex[0] == '0' && (amt_hex[1] == 'x' || amt_hex[1] == 'X'))
             amt_hex = amt_hex.substr(2);
         while (amt_hex.size() < 64) amt_hex = "0" + amt_hex;
-        emit_voucher(cli, receiver, "0x", amt_hex);
+        (void)emit_voucher(cli, receiver, "0x", amt_hex);
         std::cout << "[advance] voucher: eth_withdraw to=" << receiver
                   << " value=" << amt_hex << std::endl;
         return "accept";
     }
 
-    // erc20_withdraw ─────────────────────────────────────────────────────────
+    // erc20_withdraw — optional valueField: "omit" (default) vs "zero_hash" (32-byte zero value)
     if (cmd == "erc20_withdraw") {
         std::string token    = input.get("token").get<std::string>();
         std::string receiver = input.get("receiver").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
         auto calldata = build_erc20_transfer(receiver, amount);
-        emit_voucher(cli, token, bytes_to_hex(calldata));
+        std::string vf = "omit";
+        if (input.contains("valueField")) vf = input.get("valueField").get<std::string>();
+        if (vf == "zero_hash") {
+            (void)emit_voucher(cli, token, bytes_to_hex(calldata),
+                          std::string(64, '0')); // 32-byte zero value for token-style vouchers
+        } else {
+            (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        }
         std::cout << "[advance] voucher: erc20_withdraw token=" << token
-                  << " to=" << receiver << std::endl;
+                  << " to=" << receiver << " valueField=" << vf << std::endl;
         return "accept";
     }
 
@@ -613,7 +723,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string token_id = input.get("tokenId").get<std::string>();
         auto calldata = build_erc721_safe_transfer(g_app_address, receiver, token_id);
-        emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
         std::cout << "[advance] voucher: erc721_withdraw to=" << receiver
                   << " tokenId=" << token_id << std::endl;
         return "accept";
@@ -627,7 +737,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string id       = input.get("id").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
         auto calldata = build_erc1155_safe_transfer(g_app_address, receiver, id, amount);
-        emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
         std::cout << "[advance] voucher: erc1155_withdraw_single to=" << receiver << std::endl;
         return "accept";
     }
@@ -643,7 +753,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         for (auto &v : ids_arr)     ids.push_back(v.get<std::string>());
         for (auto &v : amounts_arr) amounts.push_back(v.get<std::string>());
         auto calldata = build_erc1155_safe_batch(g_app_address, receiver, ids, amounts);
-        emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
         std::cout << "[advance] voucher: erc1155_withdraw_batch ids=" << ids.size()
                   << " to=" << receiver << std::endl;
         return "accept";
@@ -658,7 +768,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string token_id = input.get("tokenId").get<std::string>();
         auto calldata = build_erc721_mint(receiver, token_id);
-        emit_voucher(cli, g_mint_contract, bytes_to_hex(calldata));
+        (void)emit_voucher(cli, g_mint_contract, bytes_to_hex(calldata));
         std::cout << "[advance] voucher: mint_erc721 to=" << receiver
                   << " tokenId=" << token_id << std::endl;
         return "accept";
