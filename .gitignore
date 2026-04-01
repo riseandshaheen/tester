@@ -1,6 +1,7 @@
 .cartesi
 dapp
-contracts/broadcast/Deploy.s.sol/31337/run-[0-9]*.json
-contracts/broadcast/Deploy.s.sol/31337/dry-run/
-contracts/cache/Deploy.s.sol/31337/run-[0-9]*.json
-contracts/cache/Deploy.s.sol/31337/dry-run/
+
+# Foundry build & deployment artifacts (contracts/)
+contracts/out/
+contracts/cache/
+contracts/broadcast/

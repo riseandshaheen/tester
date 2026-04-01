@@ -22,6 +22,9 @@ const RPC_URL      = process.env.RPC_URL      || 'http://127.0.0.1:6751/anvil';
 const NODE_RPC_URL = process.env.NODE_RPC_URL || 'http://127.0.0.1:6751/rpc';
 const INSPECT_URL  = process.env.INSPECT_URL  || 'http://127.0.0.1:6751/inspect/tester';
 const PRIVATE_KEY  = process.env.PRIVATE_KEY  || '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+/** Second Anvil account — for negative tests (e.g. targeted voucher must revert). */
+const OTHER_PRIVATE_KEY = process.env.OTHER_PRIVATE_KEY
+  || '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
 // Contract addresses — stable for cartesi CLI local devnets
 const ADDR = {
@@ -36,12 +39,14 @@ const ADDR = {
   TEST_ERC721:          () => e('TEST_ERC721_ADDRESS'),
   TEST_ERC1155:         () => e('TEST_ERC1155_ADDRESS'),
   MINTABLE_ERC721:      () => e('MINTABLE_ERC721_ADDRESS'),
+  DELEGATE_VOUCHER_LOGIC: () => e('DELEGATE_VOUCHER_LOGIC_ADDRESS'),
 };
 
 // =============================================================================
 // CLIENTS
 // =============================================================================
 const account = privateKeyToAccount(PRIVATE_KEY);
+const accountOther = privateKeyToAccount(OTHER_PRIVATE_KEY);
 
 // L1 public client — getCode, getBlockNumber, waitForTransactionReceipt, validateOutput, etc.
 const publicClient = createPublicClient({
@@ -56,12 +61,20 @@ const walletClient = createWalletClient({
   transport: http(RPC_URL),
 }).extend(walletActionsL1());
 
+const walletClientOther = createWalletClient({
+  chain: foundry,
+  account: accountOther,
+  transport: http(RPC_URL),
+}).extend(walletActionsL1());
+
 // L2 Cartesi node client — waitForInput, listOutputs, listReports, getNodeVersion
 const publicClientL2 = createCartesiPublicClient({
   transport: http(NODE_RPC_URL),
 });
 
 const deployer = account.address;
+/** Address of `OTHER_PRIVATE_KEY` — use as non-targeted executor in tests. */
+const otherUser = accountOther.address;
 
 // =============================================================================
 // ADVANCE INPUT — send JSON as hex-encoded payload
@@ -131,6 +144,16 @@ async function pollInput(index, timeoutMs = 90_000) {
     throw new Error(`Input ${index} timed out after ${timeoutMs}ms`);
   }
 
+  if (inputResult.status === 'EXCEPTION') {
+    return {
+      status:     'EXCEPTION',
+      epochIndex: inputResult.epochIndex,
+      notices:    [],
+      reports:    [],
+      vouchers:   [],
+    };
+  }
+
   const [outputsResult, reportsResult] = await Promise.all([
     publicClientL2.listOutputs({ application: app, inputIndex: bigIdx }),
     publicClientL2.listReports({ application: app, inputIndex: bigIdx }),
@@ -143,9 +166,10 @@ async function pollInput(index, timeoutMs = 90_000) {
   );
 
   return {
-    status:   inputResult.status,
+    status:     inputResult.status,
+    epochIndex: inputResult.epochIndex,
     notices,
-    reports:  reportsResult.data || [],
+    reports:    reportsResult.data || [],
     vouchers,
   };
 }
@@ -254,6 +278,27 @@ async function depositERC20(tokenAddr, amount) {
   return BigInt(inputAdded.index);
 }
 
+/** ERC-20 deposit with non-empty `execLayerData` (ABI-encoded bytes on the portal). */
+async function depositERC20WithExecLayer(tokenAddr, amount, execLayerDataHex) {
+  const approveHash = await walletClient.writeContract({
+    address:      tokenAddr,
+    abi:          ERC20_ABI,
+    functionName: 'approve',
+    args:         [ADDR.ERC20_PORTAL, amount],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  const hash = await walletClient.depositERC20Tokens({
+    application:   ADDR.APP(),
+    token:         tokenAddr,
+    amount,
+    execLayerData: execLayerDataHex,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
 async function depositERC721(tokenAddr, tokenId) {
   const approveHash = await walletClient.writeContract({
     address:      tokenAddr,
@@ -333,41 +378,79 @@ async function mineBlocks(n) {
 }
 
 // =============================================================================
-// VOUCHER EXECUTION
+// EPOCH CLAIM + OUTPUT PROOFS (L1 validateOutput / executeOutput)
 // =============================================================================
 
 /**
- * Poll publicClientL2.getOutput() until outputHashesSiblings is populated
- * (meaning the epoch has been finalized and the proof is ready).
- * @param {bigint} outputIndex  — the global output index in the application
+ * Poll until the node's epoch reaches CLAIM_ACCEPTED (hard acceptance for claims).
+ * Mines a few L1 blocks periodically so the node can advance even with long
+ * epoch lengths or slow polling.
+ * @param {bigint} epochIndex
  * @param {number} timeoutMs
  */
-async function waitForOutputProof(outputIndex, timeoutMs = 300_000) {
+async function waitForEpochClaimAccepted(epochIndex, timeoutMs = 600_000) {
   const app      = ADDR.APP();
   const deadline = Date.now() + timeoutMs;
-  const bigIdx   = BigInt(outputIndex);
-  let ticks = 0;
+  const ei       = BigInt(epochIndex);
+  let ticks      = 0;
   while (Date.now() < deadline) {
-    const output = await publicClientL2.getOutput({ application: app, outputIndex: bigIdx });
-    if (output && output.outputHashesSiblings !== null) return output;
-    // Mine 2 fresh blocks every ~10s so the node keeps seeing new blocks and is
-    // guaranteed to cross the epoch boundary even if the initial mineBlocks()
-    // call was not picked up immediately by the node's polling loop.
-    if (++ticks % 5 === 0) {
-      await mineBlocks(2).catch(() => {});
+    try {
+      const epoch = await publicClientL2.getEpoch({ application: app, epochIndex: ei });
+      if (epoch?.status === 'CLAIM_ACCEPTED') return epoch;
+    } catch {
+      // Epoch row may not exist yet on the node; keep mining and polling.
     }
+    if (++ticks % 5 === 0) await mineBlocks(2).catch(() => {});
     await sleep(2000);
   }
-  throw new Error(`Output ${outputIndex} proof not available after ${timeoutMs}ms`);
+  throw new Error(`Epoch ${ei} not CLAIM_ACCEPTED after ${timeoutMs}ms`);
 }
+
+/**
+ * Fetch a single output after CLAIM_ACCEPTED; proofs should already be attached.
+ * One retry with extra mining covers occasional node lag.
+ * @param {bigint|number|string} outputIndex — global output index
+ * @param {number} timeoutMs
+ */
+async function getOutputWithProof(outputIndex, timeoutMs = 60_000) {
+  const app      = ADDR.APP();
+  const bigIdx   = BigInt(outputIndex);
+  const deadline = Date.now() + timeoutMs;
+
+  async function once() {
+    return publicClientL2.getOutput({ application: app, outputIndex: bigIdx });
+  }
+
+  let output = await once();
+  if (output?.outputHashesSiblings !== null) return output;
+
+  await mineBlocks(2).catch(() => {});
+  await sleep(500);
+  output = await once();
+  if (output?.outputHashesSiblings !== null) return output;
+
+  while (Date.now() < deadline) {
+    await mineBlocks(2).catch(() => {});
+    await sleep(1000);
+    output = await once();
+    if (output?.outputHashesSiblings !== null) return output;
+  }
+  throw new Error(`Output ${outputIndex} missing Merkle siblings after CLAIM_ACCEPTED (${timeoutMs}ms)`);
+}
+
+// =============================================================================
+// VOUCHER EXECUTION
+// =============================================================================
 
 /**
  * Execute a voucher on L1 (calls the application's executeOutput).
  * Returns the transaction receipt.
  * @param {object} output  — full Output object with proof
+ * @param {{ walletClient?: import('viem').WalletClient }} [opts]  — optional signer (default: deployer)
  */
-async function executeVoucher(output) {
-  const hash    = await walletClient.executeOutput({ application: ADDR.APP(), output });
+async function executeVoucher(output, opts = {}) {
+  const wc = opts.walletClient ?? walletClient;
+  const hash = await wc.executeOutput({ application: ADDR.APP(), output });
   return publicClient.waitForTransactionReceipt({ hash });
 }
 
@@ -390,14 +473,17 @@ const uint256hex = (v) => toHex(BigInt(v), { size: 32 });
 export {
   ADDR,
   deployer,
+  otherUser,
   publicClient,
   publicClientL2,
   walletClient,
+  walletClientOther,
   sendAdvance,
   sendRawInput,
   pollInput,
   mineBlocks,
-  waitForOutputProof,
+  waitForEpochClaimAccepted,
+  getOutputWithProof,
   executeVoucher,
   validateNotice,
   noticeCount, reportCount, voucherCount,
@@ -406,7 +492,7 @@ export {
   voucherDest,
   sendInspect,
   inspectReportCount, inspectReportBytes,
-  depositEth, depositERC20, depositERC721,
+  depositEth, depositERC20, depositERC20WithExecLayer, depositERC721,
   depositERC1155Single, depositERC1155Batch,
   uint256hex,
   sleep,
